@@ -1,0 +1,345 @@
+diff --git a/src/utils/version.go b/src/utils/version.go
+new file mode 100644
+--- /dev/null
++++ b/src/utils/version.go
+@@ -0,0 +1,50 @@
++package utils
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++)
++
++// CompareVersions compares the first three numeric components of version strings.
++// Spotify build metadata after the patch component is intentionally ignored, so
++// values such as "1.2.82.428.g0ac8be2b" compare as "1.2.82".
++func CompareVersions(left, right string) (int, error) {
++	parse := func(value string) ([3]int, error) {
++		var result [3]int
++		parts := strings.Split(strings.TrimSpace(value), ".")
++		if len(parts) < 3 {
++			return result, fmt.Errorf("version %q must contain major, minor, and patch components", value)
++		}
++		for i := 0; i < len(result); i++ {
++			part := strings.TrimSpace(parts[i])
++			if part == "" {
++				return result, fmt.Errorf("version %q has an empty component", value)
++			}
++			n, err := strconv.Atoi(part)
++			if err != nil || n < 0 {
++				return result, fmt.Errorf("version %q has an invalid numeric component %q", value, part)
++			}
++			result[i] = n
++		}
++		return result, nil
++	}
++
++	a, err := parse(left)
++	if err != nil {
++		return 0, err
++	}
++	b, err := parse(right)
++	if err != nil {
++		return 0, err
++	}
++	for i := 0; i < len(a); i++ {
++		if a[i] < b[i] {
++			return -1, nil
++		}
++		if a[i] > b[i] {
++			return 1, nil
++		}
++	}
++	return 0, nil
++}
+
+diff --git a/src/utils/version_test.go b/src/utils/version_test.go
+new file mode 100644
+--- /dev/null
++++ b/src/utils/version_test.go
+@@ -0,0 +1,39 @@
++package utils
++
++import "testing"
++
++func TestCompareVersions(t *testing.T) {
++	tests := []struct {
++		left, right string
++		want        int
++	}{
++		{"1.2.56.123.gabc", "1.2.57", -1},
++		{"1.2.57", "1.2.57", 0},
++		{"1.2.82.428.g0ac8be2b", "1.2.57", 1},
++		{"1.3.0.0.gabc", "1.2.57", 1},
++		{"1.10.0", "1.9.99", 1},
++		{"2.0.0", "1.99.99", 1},
++		{"1.1.100", "1.2.28", -1},
++	}
++	for _, tt := range tests {
++		t.Run(tt.left+"_vs_"+tt.right, func(t *testing.T) {
++			got, err := CompareVersions(tt.left, tt.right)
++			if err != nil {
++				t.Fatalf("CompareVersions returned error: %v", err)
++			}
++			if got != tt.want {
++				t.Fatalf("CompareVersions(%q, %q) = %d, want %d", tt.left, tt.right, got, tt.want)
++			}
++		})
++	}
++}
++
++func TestCompareVersionsRejectsMalformedInput(t *testing.T) {
++	for _, input := range []string{"", "Dev", "1.2", "1.x.3", "1.-2.3"} {
++		t.Run(input, func(t *testing.T) {
++			if _, err := CompareVersions(input, "1.2.57"); err == nil {
++				t.Fatalf("expected malformed version %q to be rejected", input)
++			}
++		})
++	}
++}
+
+--- a/src/apply/apply.go
++++ b/src/apply/apply.go
+@@ -4,7 +4,6 @@
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+-	"strconv"
+ 	"strings"
+ 
+ 	"github.com/spicetify/cli/src/utils"
+
+--- a/src/apply/apply.go
++++ b/src/apply/apply.go
+@@ -23,3 +23,34 @@
+ 	SpicetifyVer         string
+ 	SpotifyVer           string
+ }
++
++// ValidateAdditionalOptions checks essential inputs before Apply overwrites the
++// user's Spotify Apps directory. In particular, it refuses unsupported custom-app
++// injection instead of printing an error and continuing with a partial apply.
++func ValidateAdditionalOptions(appsFolderPath string, flags Flag) error {
++	if _, err := utils.CompareVersions(flags.SpotifyVer, "1.2.57"); err != nil {
++		return fmt.Errorf("cannot determine Spotify version from %q; check the Spotify prefs path and run `spicetify backup` again: %w", flags.SpotifyVer, err)
++	}
++
++	indexPath := filepath.Join(appsFolderPath, "xpui", "index.html")
++	if _, err := os.Stat(indexPath); err != nil {
++		return fmt.Errorf("Spotify's extracted app files are incomplete (missing xpui/index.html); run `spicetify restore backup apply` after checking the Spotify installation: %w", err)
++	}
++
++	if len(flags.CustomApp) > 0 && findCustomAppTarget(appsFolderPath) == "" {
++		return fmt.Errorf("Spotify's JavaScript bundle does not match the custom-app injector; no files were modified. Update Spicetify, or temporarily remove custom apps from config and apply again")
++	}
++
++	helpers := []struct { enabled bool; name string }{
++		{flags.SidebarConfig, "sidebarConfig.js"},
++		{flags.HomeConfig, "homeConfig.js"},
++		{flags.ExpFeatures, "expFeatures.js"},
++	}
++	for _, helper := range helpers {
++		if !helper.enabled { continue }
++		if _, err := os.Stat(filepath.Join(utils.GetJsHelperDir(), helper.name)); err != nil {
++			return fmt.Errorf("required Spicetify helper %q is unavailable: %w", helper.name, err)
++		}
++	}
++	return nil
++}
+
+--- a/src/apply/apply.go
++++ b/src/apply/apply.go
+@@ -27,3 +27,6 @@
+-// AdditionalOptions .
+-func AdditionalOptions(appsFolderPath string, flags Flag) {
++// AdditionalOptions applies the JavaScript and HTML customizations.
++func AdditionalOptions(appsFolderPath string, flags Flag) error {
++	if err := ValidateAdditionalOptions(appsFolderPath, flags); err != nil {
++		return err
++	}
+ 	jsModifiers := []func(path string, flags Flag){
+
+--- a/src/apply/apply.go
++++ b/src/apply/apply.go
+@@ -46,25 +46,10 @@
+-	verParts := strings.Split(flags.SpotifyVer, ".")
+-	spotifyMajor, spotifyMinor, spotifyPatch := 0, 0, 0
+-	if len(verParts) > 0 {
+-		spotifyMajor, _ = strconv.Atoi(verParts[0])
+-	}
+-	if len(verParts) > 1 {
+-		spotifyMinor, _ = strconv.Atoi(verParts[1])
+-	}
+-	if len(verParts) > 2 {
+-		spotifyPatch, _ = strconv.Atoi(verParts[2])
+-	}
++	versionComparison, _ := utils.CompareVersions(flags.SpotifyVer, "1.2.57")
+ 	if len(flags.CustomApp) > 0 {
+-		if customAppTarget := findCustomAppTarget(appsFolderPath); customAppTarget != "" {
+-			filesToModified[customAppTarget] = append(filesToModified[customAppTarget], insertCustomApp)
+-			snapshotPath := filepath.Join(appsFolderPath, "xpui", "xpui-snapshot.js")
+-			if customAppTarget != snapshotPath {
+-				filesToModified[snapshotPath] = append(filesToModified[snapshotPath], insertCustomAppChunkMap)
+-			}
+-		} else {
+-			utils.PrintError("Spotify version mismatch with Spicetify. Please report it on our github repository.")
+-			utils.PrintInfo("Spicetify might have been updated for this version already. Please run `spicetify update` to check for a new version.")
+-			utils.PrintInfo("If one isn't available yet, please wait for an update to be released or downgrade Spotify to a supported version.")
++		customAppTarget := findCustomAppTarget(appsFolderPath)
++		filesToModified[customAppTarget] = append(filesToModified[customAppTarget], insertCustomApp)
++		snapshotPath := filepath.Join(appsFolderPath, "xpui", "xpui-snapshot.js")
++		if customAppTarget != snapshotPath {
++			filesToModified[snapshotPath] = append(filesToModified[snapshotPath], insertCustomAppChunkMap)
+ 		}
+ 	}
+-	if spotifyMajor >= 1 && spotifyMinor >= 2 && spotifyPatch >= 57 {
++	if versionComparison >= 0 {
+
+--- a/src/apply/apply.go
++++ b/src/apply/apply.go
+@@ -76,7 +76,6 @@
+ 		if err := utils.CopyFile(
+ 			filepath.Join(utils.GetJsHelperDir(), "sidebarConfig.js"),
+ 			filepath.Join(appsFolderPath, "xpui", "helper")); err != nil {
+-			utils.PrintError(err.Error())
+-			flags.SidebarConfig = false
++			return fmt.Errorf("failed to install sidebar config helper: %w", err)
+ 		}
+ 	}
+
+--- a/src/apply/apply.go
++++ b/src/apply/apply.go
+@@ -85,7 +85,6 @@
+ 		if err := utils.CopyFile(
+ 			filepath.Join(utils.GetJsHelperDir(), "homeConfig.js"),
+ 			filepath.Join(appsFolderPath, "xpui", "helper")); err != nil {
+-			utils.PrintError(err.Error())
+-			flags.HomeConfig = false
++			return fmt.Errorf("failed to install home config helper: %w", err)
+ 		}
+ 	}
+
+--- a/src/apply/apply.go
++++ b/src/apply/apply.go
+@@ -93,7 +93,6 @@
+ 		if err := utils.CopyFile(
+ 			filepath.Join(utils.GetJsHelperDir(), "expFeatures.js"),
+ 			filepath.Join(appsFolderPath, "xpui", "helper")); err != nil {
+-			utils.PrintError(err.Error())
+-			flags.ExpFeatures = false
++			return fmt.Errorf("failed to install experimental features helper: %w", err)
+ 		}
+ 	}
+
+--- a/src/apply/apply.go
++++ b/src/apply/apply.go
+@@ -107,4 +107,5 @@
+ 			call(file, flags)
+ 		}
+ 	}
++	return nil
+ }
+
+--- a/src/cmd/apply.go
++++ b/src/cmd/apply.go
+@@ -18,4 +18,25 @@
+ 		utils.PrintInfo(`Preprocessed Spotify data is outdated. Please run "spicetify restore backup apply" to receive new features and bug fixes`)
+ 		os.Exit(1)
+ 	}
++
++	extensionList := featureSection.Key("extensions").Strings("|")
++	customAppsList := featureSection.Key("custom_apps").Strings("|")
++	applyFlags := apply.Flag{
++		CurrentTheme:         settingSection.Key("current_theme").MustString(""),
++		ColorScheme:          settingSection.Key("color_scheme").MustString(""),
++		InjectThemeJS:        injectJS,
++		CheckSpicetifyUpdate: settingSection.Key("check_spicetify_update").MustBool(false),
++		Extension:            extensionList,
++		CustomApp:            customAppsList,
++		SidebarConfig:        featureSection.Key("sidebar_config").MustBool(false),
++		HomeConfig:           featureSection.Key("home_config").MustBool(false),
++		ExpFeatures:          featureSection.Key("experimental_features").MustBool(false),
++		SpicetifyVer:         backupSection.Key("with").MustString(""),
++		SpotifyVer:           utils.GetSpotifyVersion(prefsPath),
++	}
++	if err := apply.ValidateAdditionalOptions(rawFolder, applyFlags); err != nil {
++		utils.PrintError(err.Error())
++		os.Exit(1)
++	}
++
+ 	// Copy raw assets to Spotify Apps folder if Spotify is never applied
+
+--- a/src/cmd/apply.go
++++ b/src/cmd/apply.go
+@@ -64,16 +64,6 @@
+-	extensionList := featureSection.Key("extensions").Strings("|")
+-	customAppsList := featureSection.Key("custom_apps").Strings("|")
+ 	spinner, _ := utils.Spinner.Start("Applying additional modifications")
+-	apply.AdditionalOptions(appDestPath, apply.Flag{
+-		CurrentTheme:         settingSection.Key("current_theme").MustString(""),
+-		ColorScheme:          settingSection.Key("color_scheme").MustString(""),
+-		InjectThemeJS:        injectJS,
+-		CheckSpicetifyUpdate: settingSection.Key("check_spicetify_update").MustBool(false),
+-		Extension:            extensionList,
+-		CustomApp:            customAppsList,
+-		SidebarConfig:        featureSection.Key("sidebar_config").MustBool(false),
+-		HomeConfig:           featureSection.Key("home_config").MustBool(false),
+-		ExpFeatures:          featureSection.Key("experimental_features").MustBool(false),
+-		SpicetifyVer:         backupSection.Key("with").MustString(""),
+-	})
++	if err := apply.AdditionalOptions(appDestPath, applyFlags); err != nil {
++		spinner.Fail("Failed to apply additional modifications")
++		utils.Fatal(err)
++	}
+ 	spinner.Success("Applied additional modifications")
+
+--- a/src/preprocess/preprocess.go
++++ b/src/preprocess/preprocess.go
+@@ -108,12 +107,0 @@
+-	verParts := strings.Split(flags.SpotifyVer, ".")
+-	spotifyMajor, spotifyMinor, spotifyPatch := 0, 0, 0
+-	if len(verParts) > 0 {
+-		spotifyMajor, _ = strconv.Atoi(verParts[0])
+-	}
+-	if len(verParts) > 1 {
+-		spotifyMinor, _ = strconv.Atoi(verParts[1])
+-	}
+-	if len(verParts) > 2 {
+-		spotifyPatch, _ = strconv.Atoi(verParts[2])
+-	}
+-
+
+--- a/src/preprocess/preprocess.go
++++ b/src/preprocess/preprocess.go
+@@ -223,3 +223,3 @@
+-						if spotifyMajor >= 1 && spotifyMinor >= 2 && spotifyPatch >= 57 {
++						if comparison, err := utils.CompareVersions(flags.SpotifyVer, "1.2.57"); err == nil && comparison >= 0 {
+ 							content = exposeAPIs_vendor(content)
+ 						}
+
+--- a/src/preprocess/preprocess.go
++++ b/src/preprocess/preprocess.go
+@@ -229,5 +229,7 @@
+-					if spotifyMajor >= 1 && spotifyMinor >= 2 && (spotifyPatch >= 28 && spotifyPatch <= 57) {
+-						utils.ReplaceOnce(&content, `(typeName\])`, func(submatches ...string) string {
+-							return fmt.Sprintf(`%s || []`, submatches[1])
+-						})
++					if lower, err := utils.CompareVersions(flags.SpotifyVer, "1.2.28"); err == nil && lower >= 0 {
++						if upper, err := utils.CompareVersions(flags.SpotifyVer, "1.2.57"); err == nil && upper <= 0 {
++							utils.ReplaceOnce(&content, `(typeName\])`, func(submatches ...string) string {
++								return fmt.Sprintf(`%s || []`, submatches[1])
++							})
++						}
+ 					}
+
+--- a/src/preprocess/preprocess.go
++++ b/src/preprocess/preprocess.go
+@@ -234,5 +234,5 @@
+-					// to avoid syntaxerror on Spotify 1.2.78 and above
+-					if spotifyMajor == 1 && spotifyMinor == 2 && spotifyPatch < 78 {
++					// Avoid the legacy snackbar rewrite on Spotify 1.2.78 and newer.
++					if comparison, err := utils.CompareVersions(flags.SpotifyVer, "1.2.78"); err == nil && comparison < 0 {
+ 						utils.ReplaceOnce(&content, `\(\({[^}]*,\s*imageSrc`, func(submatches ...string) string {
+ 							return fmt.Sprintf("Spicetify.Snackbar.enqueueImageSnackbar=%s", submatches[0])
+ 						})
